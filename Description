@@ -11,8 +11,18 @@ This project implements and novel supervised machine learning models to classify
 
 ## 📁 Repository Contents
 
-- `platform/`: RStudio v4.5.1 for training and evaluation
-- `data/`:  Dataset (not uploaded here)
+- `platform/`: RStudio v4.5.1 for training and evaluation and testing
+- `data/`:  Open access Dataset (openNeuro) (not uploaded here)
 - `models/`: Model implementation scripts
 - `results/`: Output metrics, confusion matrices, and visualizations
 - `README.md`: Project overview
+
+## 🔧 Machine learning Algorithm
+
+ - The dataset was preprocessed by merging clinical and MRI-derived imaging features, followed by cleaning, normalization, and handling of missing values.
+ - Feature engineering included extracting over 5,000 texture and volumetric features from 26 brain regions and encoding clinical variables like race, sex, and medication history.
+ - Data was split into training and testing sets (60:40 ratio) using stratified sampling to preserve class balance.
+ - Four machine learning models were trained: GLMnet (elastic-net logistic regression), Random Forest, XGBoost, and an Attention-Weighted SVM (AttnSVM).
+ - The AttnSVM model fused two SVMs (imaging and clinical) by weighting their prediction probabilities based on AUC, enhancing decision balance across modalities.
+ - All models were evaluated on independent test data using metrics such as accuracy, AUC, precision, sensitivity, specificity, and F1-score.
+ - Visualization outputs included ROC curves, confusion matrices, calibration plots, and bar charts, with feature importance extracted for model interpretability.
