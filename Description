@@ -1,0 +1,18 @@
+# ADHD Classification Using Multimodal MRI and Clinical Features
+
+This project implements and novel supervised machine learning models to classify ADHD versus non-ADHD children using multimodal MRI features and clinical covariates. It includes a novel Attention-Weighted SVM (AttSVM) model alongside GLMnet, Random Forest, and XGBoost classifiers.
+
+## 🧠 Project Highlights
+
+- High-accuracy ADHD classification using structural MRI and clinical features
+- Comparison of 4 models: GLMnet, Random Forest, XGBoost, and AttSVM
+- Feature fusion strategy via attention-based weighting
+- Achieved 96.8% test accuracy and AUC of 0.99 using GLMnet
+
+## 📁 Repository Contents
+
+- `platform/`: RStudio v4.5.1 for training and evaluation
+- `data/`:  Dataset (not uploaded here)
+- `models/`: Model implementation scripts
+- `results/`: Output metrics, confusion matrices, and visualizations
+- `README.md`: Project overview
