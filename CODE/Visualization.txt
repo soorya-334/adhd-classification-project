@@ -1,0 +1,90 @@
+
+# ------------------------ MODEL COMPARISON PLOT ------------------------
+results_df <- bind_rows(results, .id = "Model") %>%
+  pivot_longer(-Model, names_to = "Metric", values_to = "Value") %>%
+  mutate(Model = factor(Model, levels = c("GLM", "RF", "XGB", "AttnSVM")))
+
+# 1. Create the plot
+p <- ggplot(results_df, aes(x = Model, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ Metric, scales = "free") +
+  theme_minimal() +
+  labs(title = "Model Performance Comparison")
+
+# 2. Save it
+ggsave("model_performance_comparison.png", plot = p, width = 8, height = 6)
+
+# ------------------------ FEATURE IMPORTANCE ------------------------
+imp_df <- data.frame(
+  Feature = rownames(varImp(glm_model)$importance),
+  GLM = varImp(glm_model)$importance$Overall,
+  RF = varImp(rf_model)$importance$Overall
+)
+write.csv(imp_df, "feature_importance.csv", row.names = FALSE)
+
+# ------------------------ ROC CURVE ------------------------
+y_test <- factor(y[-train_idx], levels = c("Non_ADHD", "ADHD"))
+
+roc_glm <- roc(y_test, predict(glm_model, X_test, type = "prob")[, "ADHD"])
+roc_rf  <- roc(y_test, predict(rf_model, X_test, type = "prob")[, "ADHD"])
+roc_xgb <- roc(y_test, predict(xgb_model, X_test, type = "prob")[, "ADHD"])
+roc_svm <- roc(y_test, p_attnsvm)
+
+# Plot with custom thickness and legend formatting
+roc_plot <- ggroc(
+  list(GLM = roc_glm, RF = roc_rf, XGB = roc_xgb, AttnSVM = roc_svm),
+  aes = c("color")  # enables automatic legend
+) +
+  geom_line(size = 0.5) +  # Control line thickness here
+  theme_minimal() +
+  labs(
+    title = "ROC Curves for ADHD Prediction",
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    color = "ML Model"  # Title of the legend
+  ) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.2)) +
+  scale_x_reverse(breaks = seq(1, 0, by = -0.2)) +
+  theme(
+    plot.title = element_text(size = 8, face = "bold", hjust = 0.5),  # Title
+    axis.title.x = element_text(size = 6),  # X-axis label size
+    axis.title.y = element_text(size = 6),  # Y-axis label size
+    axis.text = element_text(size = 6),
+    legend.position = "right",           # Move legend to bottom
+    legend.title = element_text(size = 6),
+    legend.text = element_text(size = 6)
+  )
+
+# Save the plot
+ggsave("roc_comparison.png", plot = roc_plot, width = 4, height = 3, dpi = 300)
+
+# ------------------------ CALIBRATION ------------------------
+cal <- calibration(y_test ~ p_attnsvm)
+plot(cal)
+ggsave("calibration_plot.png")
+
+# ------------------------ INDIVIDUAL METRIC GRAPHS (ALL MODELS) ------------------------
+metric_list <- unique(results_df$Metric)
+
+for (metric in metric_list) {
+  g <- ggplot(filter(results_df, Metric == metric), aes(x = Model, y = Value, fill = Model)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    theme_minimal(base_size = 14) +
+    labs(title = paste(metric, "Comparison Across Models"), y = metric, x = "Model") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+  
+  ggsave(paste0("metric_", tolower(metric), "_comparison.png"), g, width = 7, height = 5)
+}
+
+# ------------------------ COMBINED BAR PLOT FOR AttnSVM ONLY ------------------------
+attnsvm_df <- results_df %>% filter(Model == "AttnSVM")
+
+# Create the plot object
+attnsvm_plot <- ggplot(attnsvm_df, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  theme_minimal(base_size = 14) +
+  labs(title = "AttnSVM Model Evaluation Metrics", y = "Score", x = "Metric") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+# Save it
+ggsave("attnsvm_combined_metrics.png", plot = attnsvm_plot, width = 7, height = 5)

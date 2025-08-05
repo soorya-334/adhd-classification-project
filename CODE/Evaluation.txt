@@ -1,0 +1,44 @@
+# ------------------------ EVALUATION ------------------------
+eval_metrics <- function(pred, probs, true) {
+  true <- factor(true, levels = c("Non_ADHD", "ADHD"))
+  pred <- factor(pred, levels = c("Non_ADHD", "ADHD"))
+  
+  cm <- caret::confusionMatrix(pred, true, positive = "ADHD")
+  roc_obj <- pROC::roc(true, probs)
+  
+  Precision   <- unname(cm$byClass["Pos Pred Value"])
+  Specificity <- unname(cm$byClass["Specificity"])
+  F1          <- F_meas(pred, true, relevant = "ADHD")
+  
+  list(
+    Accuracy    = as.numeric(cm$overall["Accuracy"]),
+    Precision   = ifelse(is.nan(Precision), NA_real_, as.numeric(Precision)),
+    F1          = ifelse(is.nan(F1), NA_real_, as.numeric(F1)),
+    Specificity = as.numeric(Specificity),
+    AUC         = as.numeric(pROC::auc(roc_obj))
+  )
+}
+
+
+results <- list(
+  GLM = eval_metrics(predict(glm_model, X_test), predict(glm_model, X_test, type = "prob")[, "ADHD"], y[-train_idx]),
+  RF = eval_metrics(predict(rf_model, X_test), predict(rf_model, X_test, type = "prob")[, "ADHD"], y[-train_idx]),
+  XGB = eval_metrics(predict(xgb_model, X_test), predict(xgb_model, X_test, type = "prob")[, "ADHD"], y[-train_idx]),
+  AttnSVM = eval_metrics(pred_attnsvm, p_attnsvm, y[-train_idx])
+)
+
+print(results)
+write.csv(results, "Evaluation_matrics.csv", row.names = FALSE)
+
+# Predictions for each model
+pred_glm  <- predict(glm_model, X_test)
+pred_rf   <- predict(rf_model, X_test)
+pred_xgb  <- predict(xgb_model, X_test)
+pred_attn <- pred_attnsvm  # already created from attention fusion
+
+table(pred_glm, pred_rf)
+table(pred_glm, pred_xgb)
+table(pred_glm, pred_attn)
+table(pred_rf, pred_xgb)
+table(pred_rf, pred_attn)
+table(pred_xgb, pred_attn)
