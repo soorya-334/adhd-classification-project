@@ -1,0 +1,315 @@
+# ------------------------ LIBRARIES ------------------------
+library(tidyverse)
+library(readxl)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(e1071)
+library(pROC)
+library(recipes)
+library(reshape2)
+library(cowplot)
+library(scales)
+library(stringr)
+library(corrplot)
+
+# ------------------------ DATA LOADING ------------------------
+stat_data   <- read_excel("D:/SET PROJECT/result/Statistical_Data.xlsx")
+region_data <- read_excel("D:/SET PROJECT/result/region_matters_stats.xlsx")
+
+region_data <- region_data %>% mutate(Subject_clean = str_extract(Subject, "sub-\\d+"))
+
+clean_med <- function(df) df %>%
+  mutate(Subject = as.character(Subject) %>% trimws(),
+         ADHD_medication = case_when(
+           ADHD_medication %in% c("n/a", "NA", "", "N/A") ~ "No_Medication",
+           TRUE ~ ADHD_medication))
+stat_data   <- clean_med(stat_data)
+region_data <- clean_med(region_data)
+
+stat_wide <- stat_data %>%
+  select(Subject, sex, age_ses_T1, ADHD_diagnosis, ADHD_medication, race, ethnicity,
+         region, volume_mm3, mean_intensity, std_intensity, skewness, kurtosis,
+         contrast, homogeneity, energy, correlation, entropy, LBP_mean, fractal_dimension) %>%
+  pivot_wider(
+    id_cols = c(Subject, sex, age_ses_T1, ADHD_diagnosis, ADHD_medication, race, ethnicity),
+    names_from = region,
+    values_from = c(volume_mm3, mean_intensity, std_intensity, skewness, kurtosis,
+                    contrast, homogeneity, energy, correlation, entropy, LBP_mean, fractal_dimension),
+    names_sep = "__", values_fn = mean, values_fill = NA)
+
+region_vols <- region_data %>%
+  select(Subject_clean, starts_with("GM_volume_mm3"), starts_with("WM_volume_mm3"),
+         CSF_volume_mm3, Brain_volume_mm3, GM_WM_ratio, matches("prob_")) %>%
+  rename(Subject = Subject_clean)
+
+data <- stat_wide %>%
+  inner_join(region_vols, by = "Subject") %>%
+  filter(ADHD_diagnosis %in% c(0, 1)) %>%
+  mutate(ADHD = factor(ADHD_diagnosis, levels = c(0, 1), labels = c("Non_ADHD", "ADHD")),
+         race = replace_na(race, "Not_Identified"),
+         ethnicity = replace_na(ethnicity, "Not_Identified"),
+         sex = replace_na(sex, "Not_Identified"),
+         ADHD_medication = replace_na(ADHD_medication, "No_Medication")) %>%
+  filter(!is.na(age_ses_T1))
+
+data$Race <- factor(data$race)
+data$Ethnicity <- factor(data$ethnicity)
+data$Medication <- factor(data$ADHD_medication)
+data$AgeGroup <- cut(data$age_ses_T1, breaks = c(0, 10, 18), labels = c("0-10", "11-18"), right = FALSE)
+
+clinical_factors_full <- c("race", "ethnicity", "ADHD_medication", "sex")
+
+# X_imaging's exclusion list is ALWAYS the full clinical set, regardless of
+# any downstream toggle — this is what keeps clinical variables from
+# leaking back into the "imaging" block when medication/clinical features
+# are toggled off (see DECISION 7/8).
+X_imaging_base <- data %>%
+  select(-any_of(c("Subject", "ADHD_diagnosis", "ADHD",
+                    clinical_factors_full, "Race", "Ethnicity", "Medication", "AgeGroup")),
+         -starts_with("cerebellum_mnifnirt_prob_"))
+y_all <- data$ADHD
+
+# =============================================================
+# CORE PIPELINE — one full split -> preprocess -> train -> evaluate cycle.
+# Used both for the single detailed "primary" run (with plots) and for
+# the repeated-split validation loop (DECISION 10).
+# =============================================================
+run_one_split <- function(seed,
+                           INCLUDE_ADHD_MEDICATION = TRUE,
+                           INCLUDE_CLINICAL_FEATURES = TRUE,
+                           cv_number = 10, cv_repeats = 5,
+                           svm_grid = expand.grid(sigma = c(0.01, 0.1, 1), C = c(0.1, 1, 10)),
+                           verbose = TRUE) {
+
+  clinical_factors <- if (!INCLUDE_CLINICAL_FEATURES) {
+    character(0)
+  } else if (INCLUDE_ADHD_MEDICATION) {
+    clinical_factors_full
+  } else {
+    setdiff(clinical_factors_full, "ADHD_medication")
+  }
+  
+  cat("ADHD_medication included as predictor:", INCLUDE_ADHD_MEDICATION, "\n")
+  cat("Clinical/demographic features included:", INCLUDE_CLINICAL_FEATURES, "\n")
+
+  X_imaging <- X_imaging_base
+  y <- y_all
+
+  set.seed(seed)
+  train_idx <- createDataPartition(y, p = 0.6, list = FALSE)
+
+  # >>> DECISION 1b <<< valid_factors from TRAINING FOLD only
+  valid_factors <- if (length(clinical_factors) > 0) {
+    clinical_factors[sapply(data[train_idx, clinical_factors], \(x) n_distinct(na.omit(x)) > 1)]
+  } else character(0)
+
+  X_clinical <- if (length(valid_factors) > 0) {
+    model.matrix(reformulate(valid_factors), data = data) %>% as.data.frame()
+  } else {
+    data.frame(row.names = seq_len(nrow(data)))
+  }
+  X_all <- bind_cols(X_imaging, X_clinical)
+  X_imaging_raw  <- X_imaging
+  X_clinical_raw <- X_clinical
+
+  # >>> DECISION 2 <<< z-score scaling added; NZV/impute/dummy all fit on
+  # training fold only (DECISION 1)
+  rec <- recipe(ADHD ~ ., data = bind_cols(X_all, ADHD = y)) %>%
+    step_impute_median(all_numeric_predictors()) %>%
+    step_nzv(all_predictors()) %>%
+    step_dummy(all_nominal_predictors()) %>%
+    step_zv(all_predictors()) %>%
+    step_normalize(all_numeric_predictors())
+  rec_prep <- prep(rec, training = bind_cols(X_all[train_idx, ], ADHD = y[train_idx]))
+  X_train <- bake(rec_prep, new_data = X_all[train_idx, ])
+  X_test  <- bake(rec_prep, new_data = X_all[-train_idx, ])
+
+  ctrl <- trainControl(method = "repeatedcv", number = cv_number, repeats = cv_repeats,
+                        classProbs = TRUE, summaryFunction = twoClassSummary,
+                        savePredictions = "final")
+  y_train_clean <- factor(y[train_idx], levels = c("Non_ADHD", "ADHD"))
+  y_test_factor <- factor(y[-train_idx], levels = c("Non_ADHD", "ADHD"))
+
+  glm_model <- train(x = X_train, y = y_train_clean, method = "glmnet",
+                      metric = "ROC", trControl = ctrl)
+  rf_model  <- train(x = X_train, y = y_train_clean, method = "rf",
+                      tuneGrid = expand.grid(mtry = c(5, 10, 20)),
+                      metric = "ROC", ntree = 200, trControl = ctrl)
+  capture.output({
+    xgb_model <- train(x = X_train, y = y_train_clean, method = "xgbTree",
+                        metric = "ROC", trControl = ctrl, verbose = FALSE, nthread = 1)
+  }, file = NULL)
+
+  # ---------------- AttSVM: imaging stream ----------------
+  # >>> DECISION 3/4 <<< impute + NZV fit on training fold only
+  img_medians <- X_imaging_raw[train_idx, ] %>%
+    summarise(across(where(is.numeric), ~ median(., na.rm = TRUE)))
+  impute_with_train_median <- function(df, medians) {
+    for (col in names(medians)) if (col %in% names(df)) df[[col]][is.na(df[[col]])] <- medians[[col]]
+    df
+  }
+  X_imaging_raw_clean <- impute_with_train_median(X_imaging_raw, img_medians)
+  X_img_svm <- X_imaging_raw_clean %>% select(where(is.numeric))
+  nzv_img_svm <- nearZeroVar(X_img_svm[train_idx, ])
+  if (length(nzv_img_svm) > 0) X_img_svm <- X_img_svm[, -nzv_img_svm]
+
+  svm_img <- train(x = X_img_svm[train_idx, ], y = y_train_clean,
+                    method = "svmRadial", tuneGrid = svm_grid, metric = "ROC", trControl = ctrl)
+
+  # ---------------- AttSVM: clinical stream ----------------
+  # >>> DECISION 5 <<< NZV fit on training fold only.
+  # Guard for DECISION 8 (imaging-only ablation): skip entirely if no
+  # clinical columns exist.
+  HAS_CLINICAL <- ncol(X_clinical_raw) > 0
+  if (HAS_CLINICAL) {
+    nzv_cli <- nearZeroVar(X_clinical_raw[train_idx, ])
+    X_cli_svm <- if (length(nzv_cli) > 0) X_clinical_raw[, -nzv_cli] else X_clinical_raw
+    svm_cli <- train(x = X_cli_svm[train_idx, ], y = y_train_clean,
+                      method = "svmRadial", tuneGrid = svm_grid, metric = "ROC", trControl = ctrl)
+  }
+
+  # ---------------- Fusion weight ----------------
+  # >>> DECISION 6 <<< alpha from TRAINING CV AUC only, never test AUC
+  get_cv_auc <- function(model) {
+    bt <- model$bestTune; res <- model$results
+    match_idx <- Reduce(`&`, lapply(names(bt), function(col) res[[col]] == bt[[col]]))
+    res$ROC[match_idx][1]
+  }
+  if (HAS_CLINICAL) {
+    cv_auc_img <- get_cv_auc(svm_img)
+    cv_auc_cli <- get_cv_auc(svm_cli)
+    alpha <- cv_auc_cli / (cv_auc_cli + cv_auc_img)
+  } else {
+    cv_auc_img <- get_cv_auc(svm_img); cv_auc_cli <- NA_real_
+    alpha <- 0
+  }
+
+  # ---------------- DECISION 9: data-driven threshold ----------------
+  # Derive the AttnSVM decision threshold from FUSED TRAINING out-of-fold
+  # predictions (Youden's index), never from test data. Replaces the
+  # original hardcoded 0.6, which broke down (0% sensitivity) once the
+  # medication/sex confounds were removed — a fixed threshold tuned
+  # implicitly around inflated, confound-driven probabilities does not
+  # transfer once that inflation goes away.
+  oof_img <- svm_img$pred[svm_img$pred$sigma == svm_img$bestTune$sigma &
+                           svm_img$pred$C == svm_img$bestTune$C, c("rowIndex", "ADHD", "obs")]
+  names(oof_img)[names(oof_img) == "ADHD"] <- "p_img"
+
+  if (HAS_CLINICAL) {
+    oof_cli <- svm_cli$pred[svm_cli$pred$sigma == svm_cli$bestTune$sigma &
+                             svm_cli$pred$C == svm_cli$bestTune$C, c("rowIndex", "ADHD")]
+    names(oof_cli)[names(oof_cli) == "ADHD"] <- "p_cli"
+    oof <- merge(oof_img, oof_cli, by = "rowIndex")
+    oof$p_fused <- alpha * oof$p_cli + (1 - alpha) * oof$p_img
+  } else {
+    oof <- oof_img
+    oof$p_fused <- oof$p_img
+  }
+  roc_oof <- pROC::roc(oof$obs, oof$p_fused, levels = c("Non_ADHD", "ADHD"),
+                        direction = "<", quiet = TRUE)
+  thr <- as.numeric(pROC::coords(roc_oof, "best", best.method = "youden",
+                                  ret = "threshold", transpose = TRUE)[1])
+  if (is.na(thr)) thr <- 0.5  # fallback if Youden fails to find a unique optimum
+
+  # ---------------- Test-set prediction (test data touched ONLY here) ----------------
+  p_img <- predict(svm_img, newdata = X_img_svm[-train_idx, ], type = "prob")[, "ADHD"]
+  p_cli <- if (HAS_CLINICAL) predict(svm_cli, newdata = X_cli_svm[-train_idx, ], type = "prob")[, "ADHD"] else rep(0, length(p_img))
+  p_attnsvm <- alpha * p_cli + (1 - alpha) * p_img
+  pred_attnsvm <- factor(ifelse(p_attnsvm > thr, "ADHD", "Non_ADHD"), levels = c("Non_ADHD", "ADHD"))
+
+  # ---------------- Evaluation ----------------
+  eval_metrics <- function(pred, probs, true) {
+    true <- factor(true, levels = c("Non_ADHD", "ADHD"))
+    pred <- factor(pred, levels = c("Non_ADHD", "ADHD"))
+    cm <- caret::confusionMatrix(pred, true, positive = "ADHD")
+    roc_obj <- tryCatch(pROC::roc(true, probs, quiet = TRUE), error = function(e) NULL)
+    Precision <- unname(cm$byClass["Pos Pred Value"])
+    F1 <- suppressWarnings(F_meas(pred, true, relevant = "ADHD"))
+    list(Accuracy = as.numeric(cm$overall["Accuracy"]),
+         Accuracy_CI_Lo = as.numeric(cm$overall["AccuracyLower"]),
+         Accuracy_CI_Hi = as.numeric(cm$overall["AccuracyUpper"]),
+         Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+         Specificity = as.numeric(cm$byClass["Specificity"]),
+         Precision = ifelse(is.nan(Precision), NA_real_, as.numeric(Precision)),
+         F1 = ifelse(is.nan(F1), NA_real_, as.numeric(F1)),
+         AUC = if (!is.null(roc_obj)) as.numeric(pROC::auc(roc_obj)) else NA_real_)
+  }
+
+  res <- bind_rows(
+    c(Model = "GLM",     Seed = seed, eval_metrics(predict(glm_model, X_test), predict(glm_model, X_test, type="prob")[,"ADHD"], y[-train_idx])),
+    c(Model = "RF",      Seed = seed, eval_metrics(predict(rf_model,  X_test), predict(rf_model,  X_test, type="prob")[,"ADHD"], y[-train_idx])),
+    c(Model = "XGB",     Seed = seed, eval_metrics(predict(xgb_model, X_test), predict(xgb_model, X_test, type="prob")[,"ADHD"], y[-train_idx])),
+    c(Model = "AttnSVM", Seed = seed, eval_metrics(pred_attnsvm, p_attnsvm, y[-train_idx]))
+  ) %>% mutate(across(-Model, as.numeric),
+               Predictors = ncol(X_train), Alpha = alpha, Threshold = thr,
+               CV_AUC_img = cv_auc_img, CV_AUC_cli = cv_auc_cli)
+
+  if (verbose) {
+    cat(sprintf("Seed %d | predictors=%d | alpha=%.3f | threshold=%.3f\n",
+                seed, ncol(X_train), alpha, thr))
+  }
+  res
+}
+
+# =============================================================
+# PRIMARY RUN — matches original manuscript methodology (full CV settings,
+# same seed=75 as your original script), for the main reported result and
+# plots. Set your configuration here.
+# =============================================================
+INCLUDE_ADHD_MEDICATION   <- TRUE   # >>> DECISION 7 <<<
+INCLUDE_CLINICAL_FEATURES <- TRUE   # >>> DECISION 8 <<<
+
+primary <- run_one_split(seed = 75,
+                          INCLUDE_ADHD_MEDICATION = INCLUDE_ADHD_MEDICATION,
+                          INCLUDE_CLINICAL_FEATURES = INCLUDE_CLINICAL_FEATURES,
+                          cv_number = 10, cv_repeats = 5)
+print(primary)
+med_suffix <- paste0(if (INCLUDE_ADHD_MEDICATION) "_withMed" else "_noMed",
+                      if (!INCLUDE_CLINICAL_FEATURES) "_imagingOnly" else "")
+write.csv(primary, paste0("Evaluation_metrics_CORRECTED", med_suffix, ".csv"), row.names = FALSE)
+
+# =============================================================
+# >>> DECISION 10 <<< REPEATED-SPLIT VALIDATION — R1-#3 / R2-major
+# Repeats the ENTIRE split -> preprocess -> train -> evaluate cycle across
+# many random partitions instead of trusting a single 60/40 split. Uses
+# lighter CV settings (5-fold, 1 repeat, smaller SVM grid) to keep runtime
+# reasonable — this is a validation-strategy check, not the primary result,
+# so it doesn't need to be as exhaustively tuned as the primary run above.
+# Expect this to take a while (N_REPEATS × 4 models × lighter CV each).
+RUN_REPEATED_SPLIT_VALIDATION <- TRUE
+N_REPEATS <- 30
+
+if (RUN_REPEATED_SPLIT_VALIDATION) {
+  light_svm_grid <- expand.grid(sigma = c(0.05, 0.5), C = c(1, 10))
+  repeated_results <- map_dfr(1:N_REPEATS, function(i) {
+    run_one_split(seed = 1000 + i,
+                   INCLUDE_ADHD_MEDICATION = INCLUDE_ADHD_MEDICATION,
+                   INCLUDE_CLINICAL_FEATURES = INCLUDE_CLINICAL_FEATURES,
+                   cv_number = 5, cv_repeats = 1, svm_grid = light_svm_grid,
+                   verbose = TRUE)
+  })
+  write.csv(repeated_results, paste0("Repeated_split_results", med_suffix, ".csv"), row.names = FALSE)
+
+  summary_stats <- repeated_results %>%
+    group_by(Model) %>%
+    summarise(N = n(),
+              Mean_Accuracy = mean(Accuracy), SD_Accuracy = sd(Accuracy),
+              Median_Accuracy = median(Accuracy),
+              Pct2.5 = quantile(Accuracy, 0.025), Pct97.5 = quantile(Accuracy, 0.975),
+              Mean_AUC = mean(AUC, na.rm = TRUE), SD_AUC = sd(AUC, na.rm = TRUE),
+              Pct_Below_Chance = mean(Accuracy < 0.5484) * 100, .groups = "drop")
+  print(summary_stats)
+  write.csv(summary_stats, paste0("Repeated_split_summary", med_suffix, ".csv"), row.names = FALSE)
+
+  box_plot <- ggplot(repeated_results, aes(x = Model, y = Accuracy, fill = Model)) +
+    geom_boxplot() +
+    geom_jitter(width = 0.15, alpha = 0.4) +
+    geom_hline(yintercept = 0.5484, linetype = "dashed", color = "red") +
+    theme_minimal(base_size = 13) +
+    labs(title = paste0("Accuracy across ", N_REPEATS, " random splits (", med_suffix, ")"),
+         subtitle = "Dashed line = no-information rate (majority class baseline)",
+         y = "Test Accuracy")
+  ggsave(paste0("repeated_split_accuracy", med_suffix, ".png"), box_plot, width = 8, height = 6)
+}
